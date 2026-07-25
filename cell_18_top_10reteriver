@@ -1,0 +1,117 @@
+# ==========================================================
+# Cell 18 : Graph-Scoped BM25 Retriever (chunks)
+#   BM25 seeds -> BFS 2 hops -> scope. BM25 ranks CHUNKS in scope. top-K=10.
+#   Output: response_kg = {"predictions":[{"data":[{content,title,reference}]}]}
+# ==========================================================
+import re, math, json, hashlib
+from collections import Counter
+
+# use the eval's QUESTION if it exists, else this local default
+query = QUESTION if "QUESTION" in dir() else "Why is being a SQEP important in the context described in the document?"
+
+TOP_K, N_SEEDS, MAX_HOP = 10, 5, 2
+CHUNK_SIZE, CHUNK_STRIDE, MIN_CHUNK, MAX_PER_DOC = 900, 700, 120, 2
+JACCARD, SHINGLE_N = 0.25, 6
+
+def toks(t): return re.findall(r'[a-z0-9]+', str(t).lower())
+def tset(t): return set(toks(t))
+def shingles(t,n=SHINGLE_N):
+    w=toks(t); return {" ".join(w[i:i+n]) for i in range(max(0,len(w)-n+1))}
+def nhash(t): return hashlib.md5(" ".join(toks(t)).encode()).hexdigest()
+def clean(t):
+    t=t or ''
+    t=re.sub(r'\(%[^%]*%\)',' ',t); t=re.sub(r'\{\{[^}]*\}\}',' ',t)
+    t=re.sub(r'<[^>]{1,200}>',' ',t); t=re.sub(r'\[\[([^\]>]+)>>[^\]]+\]\]',r'\1',t)
+    t=re.sub(r'https?://\S+',' ',t); t=re.sub(r'[ \t]{2,}',' ',t)
+    return re.sub(r'\n{3,}','\n\n',t).strip()
+def split_chunks(text):
+    text=clean(text)
+    units=[u.strip() for u in re.split(r'(?<=[.!?])\s+|\n+',text) if u.strip()]
+    if not units: return []
+    out=[]; i=0
+    while i<len(units):
+        buf,j="",i
+        while j<len(units) and len(buf)+len(units[j])+1<=CHUNK_SIZE:
+            buf=(buf+" "+units[j]).strip(); j+=1
+        if j==i: out.append(units[i][:CHUNK_SIZE]); i+=1; continue
+        if len(buf)>=MIN_CHUNK: out.append(buf)
+        adv,k=0,i
+        while k<j and adv<CHUNK_STRIDE: adv+=len(units[k])+1; k+=1
+        i=max(k,i+1)
+    return out
+
+# --- Build chunk corpus + BM25 IDF ---
+CORPUS, DF = [], Counter()
+for n,a in KG.nodes(data=True):
+    if not a.get("content"): continue
+    for ch in split_chunks(a["content"]):
+        tf=Counter(toks(ch))
+        if not tf: continue
+        CORPUS.append({"content":ch,"title":a.get("title",n),"reference":n,"tf":tf,"len":sum(tf.values())})
+        for w in tf: DF[w]+=1
+Nc=max(1,len(CORPUS)); AVG=sum(c["len"] for c in CORPUS)/Nc
+IDF={w:math.log(1+(Nc-df+0.5)/(df+0.5)) for w,df in DF.items()}
+print(f"Corpus: {Nc} chunks | vocab {len(DF)}  (returning top {TOP_K})")
+print(f"Query: {query}")
+
+q_terms=tset(query)
+def bm25(tf,ln,k1=1.5,b=0.75):
+    s=0.0
+    for w in q_terms:
+        f=tf.get(w,0)
+        if f: s+=IDF.get(w,0)*(f*(k1+1))/(f+k1*(1-b+b*ln/AVG))
+    return s
+
+# --- BM25 seeds -> BFS 2 hops -> scope (graph gate) ---
+seed_scores={}
+for n,a in KG.nodes(data=True):
+    if not a.get("content"): continue
+    t_tok=tset(a.get("title","") or ""); c_tok=tset((a.get("content","") or "")[:8000])
+    s=3*sum(IDF.get(w,0) for w in q_terms if w in t_tok)+sum(IDF.get(w,0) for w in q_terms if w in c_tok)
+    if s>0: seed_scores[n]=s
+seeds=[n for n,_ in sorted(seed_scores.items(),key=lambda x:x[1],reverse=True)[:N_SEEDS]]
+
+def neighbours(node): return set(KG.successors(node)) | set(KG.predecessors(node))
+hops={s:0 for s in seeds}; frontier=set(seeds)
+for hop in range(1,MAX_HOP+1):
+    nxt=set()
+    for cur in frontier:
+        for nb in neighbours(cur):
+            if nb not in hops: hops[nb]=hop; nxt.add(nb)
+    frontier=nxt
+scope=set(hops)
+print(f"Seeds {len(seeds)} -> scope {len(scope)} docs within {MAX_HOP} hops")
+
+# --- BM25 rank chunks WITHIN scope only ---
+scored=[]
+for c in CORPUS:
+    if c["reference"] not in scope: continue      # graph gate
+    b=bm25(c["tf"],c["len"])
+    if b==0: continue
+    hop=hops[c["reference"]]
+    b += (MAX_HOP - min(hop, MAX_HOP)) * 0.5       # small closeness nudge
+    scored.append({**{k:c[k] for k in ("content","title","reference")},
+                   "_score":round(b,2), "_hop":hop})
+scored.sort(key=lambda x:x["_score"],reverse=True)
+
+# --- dedup + max 2 per doc -> top 10 ---
+chosen,seen_h,seen_sh,per_doc=[],set(),[],{}
+for c in scored:
+    if len(chosen)>=TOP_K: break
+    if per_doc.get(c["reference"],0)>=MAX_PER_DOC: continue
+    h=nhash(c["content"])
+    if h in seen_h: continue
+    sh=shingles(c["content"])
+    if sh and any(len(sh&p)/len(sh|p)>JACCARD for p in seen_sh): continue
+    chosen.append(c); seen_h.add(h); seen_sh.append(sh)
+    per_doc[c["reference"]]=per_doc.get(c["reference"],0)+1
+
+print("-"*70)
+for i,c in enumerate(chosen,1):
+    print(f"{i:>2}. score={c['_score']:6.2f} hop={c['_hop']} {c['title'][:45]}")
+print("-"*70)
+
+# --- payload: renamed response -> response_kg so Cell 20 (eval) can read it ---
+response_kg = {"predictions":[{"data":[
+    {"content":c["content"],"title":c["title"],"reference":c["reference"]} for c in chosen]}]}
+print("Status Code: 200\n"); print(json.dumps(response_kg,indent=2,ensure_ascii=False))
