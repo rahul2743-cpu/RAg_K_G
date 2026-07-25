@@ -1,0 +1,78 @@
+# ==========================================================
+# Cell 28 : (LLM-Judged via MLflow) — colleague's structure, KG data
+# ==========================================================
+import mlflow
+import json
+from mlflow.entities import Feedback, AssessmentSource
+from databricks.agents.evals import metric, judges
+
+# ----------------------------------------------------------
+# Custom LLM-judged Precision@K   (colleague's code, unchanged)
+# ----------------------------------------------------------
+def judged_precision_at_k(request, retrieved_context, k):
+    """
+    LLM-judged Precision@K: Uses MLflow's chunk_relevance judge to determine
+    whether each retrieved chunk is semantically relevant to the query.
+    """
+    judged_precisions = [judges.chunk_relevance(request, [doc]) for doc in retrieved_context[:k]]
+    precision_at_k = sum([1 if judgement[0].value == 'yes' else 0 for judgement in judged_precisions]) / k
+
+    rationales = [
+        f"""## Chunk {i+1}: `{retrieved_context[i].get('doc_uri', 'unknown')}`\n- **{judged_precisions[i][0].value}**: {judged_precisions[i][0].rationale}"""
+        for i in range(len(judged_precisions))
+    ]
+
+    return Feedback(
+        name=f'judged_precision_at_{k}',
+        value=precision_at_k,
+        rationale='\n'.join(rationales),
+        source=AssessmentSource(source_type="LLM_JUDGE", source_id="chunk_relevance_judge")
+    )
+
+@metric
+def judged_precision_at_10(request, retrieved_context):
+    """Judged Precision@10 - fraction of top chunks judged relevant by LLM."""
+    return judged_precision_at_k(request=request, retrieved_context=retrieved_context, k=5)
+
+# ==========================================================
+# Prepare eval data  (KG pipeline instead of table)
+# ==========================================================
+EVAL_TABLE = "knwbt_airr_foundry_dev_catalog.secured.rag_eval_set"
+eval_df = spark.table(EVAL_TABLE).select("request").limit(50).toPandas()
+
+# retrieved_context + response from YOUR KG functions (Cells 16/17/18)
+eval_df["retrieved_context"] = eval_df["request"].apply(retrieve_chunks)   # Cell 18 -> [{doc_uri, content}]
+eval_df["response"]          = eval_df["request"].apply(generate_answer)   # Cell 16->17->LLM answer
+
+# mlflow.entities expects only 'doc_uri' and 'content' keys
+eval_df["retrieved_context"] = eval_df["retrieved_context"].apply(
+    lambda chunks: [{"doc_uri": c.get("doc_uri", ""), "content": c.get("content", "")} for c in chunks] if isinstance(chunks, list) else chunks
+)
+
+# Build eval_data with: retrieved_context , response
+eval_data = (
+    eval_df[["request", "retrieved_context", "response"]]
+    .to_dict(orient="records")
+)
+
+# ==========================================================
+# Run MLflow evaluate  (colleague's block, unchanged)
+# ==========================================================
+with mlflow.start_run(run_name="retrieval_eval_judged_after_enrich"):
+    results = mlflow.evaluate(
+        data=eval_data,
+        model_type="databricks-agent",
+        evaluator_config={
+            "databricks-agent": {
+                "metrics": ["chunk_relevance", "relevance_to_query"]
+            }
+        },
+        extra_metrics=[judged_precision_at_10]
+    )
+
+    print("=" * 60)
+    print("    JUDGED PRECISION@K RESULTS (LLM-judged)")
+    print("=" * 60)
+    print(f"\nAll metrics: {results.metrics}")
+    print("=" * 60)
+    display(results.tables["eval_results"])
