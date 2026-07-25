@@ -1,0 +1,83 @@
+# ==========================================================
+# Cell 16 : Graph-Scoped BM25 Retriever (documents) — as a function
+# ==========================================================
+import re, math
+from collections import Counter
+print("="*80); print("GRAPH-SCOPED BM25 RETRIEVER (docs)"); print("="*80)
+
+TOP_K, N_SEEDS, MAX_HOP = 10, 5, 2
+
+def toks(t): return re.findall(r'[a-z0-9]+', str(t).lower())
+def tset(t): return set(toks(t))
+
+# --- BM25 IDF over documents (built ONCE, reused by every query) ---
+DF, DOCS = Counter(), []
+for n, a in KG.nodes(data=True):
+    if not a.get("content"): continue
+    terms = tset((a.get("title","") or "") + " " + (a.get("content","") or ""))
+    DOCS.append((n, a, Counter(toks((a.get("title","") or "")+" "+(a.get("content","") or ""))), len(terms)))
+    for w in set(terms): DF[w] += 1
+Nd  = max(1, len(DOCS))
+IDF = {w: math.log(1 + (Nd - df + 0.5)/(df + 0.5)) for w, df in DF.items()}
+AVG = sum(d[3] for d in DOCS)/Nd
+
+def neighbours(node): return set(KG.successors(node)) | set(KG.predecessors(node))
+
+def bm25(tf, ln, q_terms, k1=1.5, b=0.75):
+    s = 0.0
+    for w in q_terms:
+        f = tf.get(w, 0)
+        if f: s += IDF.get(w,0)*(f*(k1+1))/(f + k1*(1 - b + b*ln/AVG))
+    return s
+
+def retrieve_docs(USER_QUERY, verbose=False):
+    """Cell 16 logic: returns (candidates, retrieved_edges) for a query."""
+    q_terms = tset(USER_QUERY)
+
+    # 1. BM25 seeds (title weighted)
+    seed_scores = {}
+    for n, a, tf, ln in DOCS:
+        t_tok = tset(a.get("title","") or "")
+        s = 3*sum(IDF.get(w,0) for w in q_terms if w in t_tok) + bm25(tf, ln, q_terms)
+        if s > 0: seed_scores[n] = s
+    seeds = [n for n,_ in sorted(seed_scores.items(), key=lambda x:x[1], reverse=True)[:N_SEEDS]]
+
+    # 2. BFS max-hop 2, both directions -> scope + edges
+    hops = {s: 0 for s in seeds}
+    retrieved_edges, seen_e = [], set()
+    frontier = set(seeds)
+    for hop in range(1, MAX_HOP+1):
+        nxt = set()
+        for cur in frontier:
+            for nb in neighbours(cur):
+                for a, b in ((cur, nb), (nb, cur)):
+                    if KG.has_edge(a, b) and (a, b) not in seen_e:
+                        seen_e.add((a, b)); ed = KG.get_edge_data(a, b)
+                        retrieved_edges.append((a, b, ed[list(ed)[0]] if ed else {}))
+                if nb not in hops:
+                    hops[nb] = hop; nxt.add(nb)
+        frontier = nxt
+    scope = set(hops)
+
+    # 3. BM25 rank docs WITHIN scope only
+    scored = []
+    for n, a, tf, ln in DOCS:
+        if n not in scope: continue
+        score = bm25(tf, ln, q_terms) + (MAX_HOP - min(hops[n], MAX_HOP))
+        if score > 0: scored.append((n, a, round(score, 3)))
+    scored.sort(key=lambda x: x[2], reverse=True)
+
+    candidates = [{
+        "doc_id": n, "title": a.get("title", n), "reference": n,
+        "content": a.get("content",""), "hop": hops.get(n, 99), "score": s,
+    } for n, a, s in scored[:TOP_K]]
+
+    if verbose:
+        print(f"Seeds: {len(seeds)} | Scope: {len(scope)} docs | Edges: {len(retrieved_edges)}")
+        for r, c in enumerate(candidates, 1):
+            print(f"{r:>2}. score={c['score']:6.2f} hop={c['hop']}  {c['title'][:55]}")
+    return candidates, retrieved_edges
+
+# --- demo run (same as before) ---
+USER_QUERY = "How can a new Test Environment be created in the application?"
+candidates, retrieved_edges = retrieve_docs(USER_QUERY, verbose=True)
