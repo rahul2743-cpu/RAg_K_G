@@ -1,0 +1,54 @@
+# ==========================================================
+# Cell : Evaluate the GENERATED ANSWER (LLM response quality)
+#   Same MLflow structure as the retrieval eval, but judges
+#   the final_answer from Cell 18 instead of the chunks.
+# ==========================================================
+import mlflow
+import pandas as pd
+from databricks.agents.evals import metric, judges
+
+# --- must have run: question cell -> Cell 16 -> 17 -> 18 (final_answer) ---
+# QUESTION      : the question
+# final_answer  : the LLM's generated answer (from Cell 18)
+# candidates    : retrieved docs (from Cell 16) -> used as the grounding context
+
+# ----------------------------------------------------------
+# 1. Build the context the answer was grounded on (from Cell 16 docs)
+# ----------------------------------------------------------
+retrieved_context = [
+    {"doc_uri": c["reference"], "content": (c["content"] or "")[:1500]}
+    for c in candidates
+]
+
+# ----------------------------------------------------------
+# 2. One eval row: question + generated answer + grounding context
+# ----------------------------------------------------------
+eval_data = [{
+    "request": QUESTION,
+    "response": final_answer,            # <- the LLM answer being judged
+    "retrieved_context": retrieved_context,
+}]
+
+# ----------------------------------------------------------
+# 3. Run MLflow evaluate on GENERATION metrics
+#    relevance_to_query : is the answer on-topic?
+#    groundedness       : is it supported by the context (not hallucinated)?
+# ----------------------------------------------------------
+with mlflow.start_run(run_name="kg_answer_generation_eval"):
+    results = mlflow.evaluate(
+        data=eval_data,
+        model_type="databricks-agent",
+        evaluator_config={
+            "databricks-agent": {
+                "metrics": ["relevance_to_query", "groundedness"]
+            }
+        },
+    )
+    print("=" * 60)
+    print("    ANSWER GENERATION EVALUATION (LLM-judged)")
+    print("=" * 60)
+    print(f"\nQuestion : {QUESTION}")
+    print(f"\nAll metrics: {results.metrics}")
+    print("=" * 60)
+
+display(results.tables["eval_results"])
