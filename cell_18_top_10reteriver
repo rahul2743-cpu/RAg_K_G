@@ -6,8 +6,14 @@
 import re, math, json, hashlib
 from collections import Counter
 
-# use the eval's QUESTION if it exists, else this local default
-query = QUESTION if "QUESTION" in dir() else "Why is being a SQEP important in the context described in the document?"
+# --- query source priority: eval's QUESTION > Cell 16's USER_QUERY > default ---
+if "QUESTION" in dir():
+    query = QUESTION            # set by Cell 20 (eval) — keeps both sides identical
+elif "USER_QUERY" in dir():
+    query = USER_QUERY          # set by Cell 16 — normal run
+else:
+    query = "Why is being a SQEP important in the context described in the document?"
+print(f"[Cell 18 using query]: {query}\n")
 
 TOP_K, N_SEEDS, MAX_HOP = 10, 5, 2
 CHUNK_SIZE, CHUNK_STRIDE, MIN_CHUNK, MAX_PER_DOC = 900, 700, 120, 2
@@ -52,7 +58,6 @@ for n,a in KG.nodes(data=True):
 Nc=max(1,len(CORPUS)); AVG=sum(c["len"] for c in CORPUS)/Nc
 IDF={w:math.log(1+(Nc-df+0.5)/(df+0.5)) for w,df in DF.items()}
 print(f"Corpus: {Nc} chunks | vocab {len(DF)}  (returning top {TOP_K})")
-print(f"Query: {query}")
 
 q_terms=tset(query)
 def bm25(tf,ln,k1=1.5,b=0.75):
@@ -106,12 +111,20 @@ for c in scored:
     chosen.append(c); seen_h.add(h); seen_sh.append(sh)
     per_doc[c["reference"]]=per_doc.get(c["reference"],0)+1
 
-print("-"*70)
-for i,c in enumerate(chosen,1):
-    print(f"{i:>2}. score={c['_score']:6.2f} hop={c['_hop']} {c['title'][:45]}")
-print("-"*70)
+# --- final output: only content, title, reference ---
+results = [
+    {"content": c["content"], "title": c["title"], "reference": c["reference"]}
+    for c in chosen
+]
 
-# --- payload: renamed response -> response_kg so Cell 20 (eval) can read it ---
-response_kg = {"predictions":[{"data":[
-    {"content":c["content"],"title":c["title"],"reference":c["reference"]} for c in chosen]}]}
-print("Status Code: 200\n"); print(json.dumps(response_kg,indent=2,ensure_ascii=False))
+# payload for Cell 20 (eval) — same three fields
+response_kg = {"predictions": [{"data": results}]}
+
+# clean display: title + reference + content only
+print("="*80)
+print(f"TOP {len(results)} CHUNKS")
+print("="*80)
+for i, r in enumerate(results, 1):
+    print(f"\n[{i}] TITLE     : {r['title']}")
+    print(f"    REFERENCE : {r['reference']}")
+    print(f"    CONTENT   : {r['content'][:300]}...")
