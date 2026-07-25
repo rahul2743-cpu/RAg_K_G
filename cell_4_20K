@@ -1,0 +1,43 @@
+# ==========================================================
+# Cell 4 : Load XML Documents (scalable via TOP_XML)
+# ==========================================================
+from pyspark.sql import functions as F
+
+RAW_TABLE = "knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data"
+TOP_XML   = 15000          # how many documents to build the graph from
+
+raw_df = spark.table(RAW_TABLE)
+
+print("=" * 80)
+print("KNOWBOT RAW DATA")
+print("=" * 80)
+print(f"Total XML Documents : {raw_df.count()}")
+print(f"Loading (TOP_XML)   : {TOP_XML}")
+
+# ----------------------------------------------------------
+# Take TOP_XML documents from the full corpus
+# Dedupe on doc_id, select required columns
+# ----------------------------------------------------------
+matched_xml = (
+    raw_df
+    .dropDuplicates(["doc_id"])
+    .limit(TOP_XML)
+    .select(
+        "doc_id",
+        "title",
+        "content",
+        "reference",
+        "source",
+        "version",
+        "content_update_date",
+        "content_author",
+    )
+)
+
+print()
+print("=" * 80)
+print("XML DOCUMENTS LOADED")
+print("=" * 80)
+print(f"Documents to build graph from : {matched_xml.count()}")
+print()
+display(matched_xml)
