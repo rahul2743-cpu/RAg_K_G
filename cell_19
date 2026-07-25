@@ -48,6 +48,81 @@ with mlflow.start_run(run_name="kg_answer_generation_eval"):
     print("    ANSWER GENERATION EVALUATION (LLM-judged)")
     print("=" * 60)
     print(f"\nQuestion : {QUESTION}")
+
+
+
+
+
+
+# ==========================================================
+# Cell 18b : Full eval of the KG pipeline (this question)
+#   Retrieval metrics : chunk_relevance, judged_precision  (on Cell 16 docs)
+#   Generation metric : relevance_to_query                 (on Cell 18 answer)
+# ==========================================================
+import mlflow
+from mlflow.entities import Feedback, AssessmentSource
+from databricks.agents.evals import metric, judges
+
+# --- guardrails: needs Cell 16 + Cell 18 to have run ---
+if "final_answer" not in dir():
+    raise NameError("final_answer not set. Run Cell 18 (LLM answer) first.")
+if "candidates" not in dir():
+    raise NameError("candidates not set. Run Cell 16 first.")
+
+K = 10
+
+# 1. context (Cell 16 documents) + the generated answer
+retrieved_context = [
+    {"doc_uri": c["reference"], "content": (c["content"] or "")[:1500]}
+    for c in candidates
+]
+
+# 2. custom judged precision@k (colleague's, with divide-by-actual fix)
+def judged_precision_at_k(request, retrieved_context, k):
+    judged = [judges.chunk_relevance(request, [doc]) for doc in retrieved_context[:k]]
+    denom = min(k, len(judged)) or 1
+    precision = sum(1 if j[0].value == 'yes' else 0 for j in judged) / denom
+    rationales = [
+        f"""## Chunk {i+1}: `{retrieved_context[i].get('doc_uri','unknown')}`\n- **{judged[i][0].value}**: {judged[i][0].rationale}"""
+        for i in range(len(judged))
+    ]
+    return Feedback(
+        name=f'judged_precision_at_{k}', value=precision,
+        rationale='\n'.join(rationales),
+        source=AssessmentSource(source_type="LLM_JUDGE", source_id="chunk_relevance_judge"),
+    )
+
+@metric
+def judged_precision_at_10(request, retrieved_context):
+    return judged_precision_at_k(request=request, retrieved_context=retrieved_context, k=K)
+
+# 3. one eval row: question + generated answer + grounding context
+eval_data = [{
+    "request": QUESTION,
+    "response": final_answer,
+    "retrieved_context": retrieved_context,
+}]
+
+# 4. run retrieval + generation metrics together
+with mlflow.start_run(run_name="kg_full_pipeline_eval"):
+    results = mlflow.evaluate(
+        data=eval_data,
+        model_type="databricks-agent",
+        evaluator_config={
+            "databricks-agent": {
+                "metrics": ["chunk_relevance", "relevance_to_query"]
+            }
+        },
+        extra_metrics=[judged_precision_at_10],
+    )
+    print("=" * 60)
+    print("    KG PIPELINE EVALUATION (retrieval + generation)")
+    print("=" * 60)
+    print(f"\nQuestion : {QUESTION}")
+    print(f"\nAll metrics: {results.metrics}")
+    print("=" * 60)
+
+display(results.tables["eval_results"])
     print(f"\nAll metrics: {results.metrics}")
     print("=" * 60)
 
