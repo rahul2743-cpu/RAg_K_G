@@ -1,18 +1,15 @@
 # ==========================================================
-# Cell 18 : Graph-Scoped BM25 Retriever (chunks)
-#   BM25 seeds -> BFS 2 hops -> scope. BM25 ranks CHUNKS in scope. top-K=10.
-#   Output: response_kg = {"predictions":[{"data":[{content,title,reference}]}]}
+# Cell 18 : Graph-Scoped BM25 Retriever (chunks) — NO LLM
+#   Query comes from Cell 16 (USER_QUERY).
+#   BM25 seeds -> BFS 2 hops -> scope -> BM25 ranks chunks in scope.
+#   Returns top-10 chunks: {content, title, reference}
+#   Output var: response_kg  (read by Cell 20 eval)
 # ==========================================================
 import re, math, json, hashlib
 from collections import Counter
 
-# --- query source priority: eval's QUESTION > Cell 16's USER_QUERY > default ---
-if "QUESTION" in dir():
-    query = QUESTION            # set by Cell 20 (eval) — keeps both sides identical
-elif "USER_QUERY" in dir():
-    query = USER_QUERY          # set by Cell 16 — normal run
-else:
-    query = "Why is being a SQEP important in the context described in the document?"
+# --- query always comes from Cell 16's USER_QUERY ---
+query = USER_QUERY if "USER_QUERY" in dir() else "Why is being a SQEP important in the context described in the document?"
 print(f"[Cell 18 using query]: {query}\n")
 
 TOP_K, N_SEEDS, MAX_HOP = 10, 5, 2
@@ -85,7 +82,7 @@ for hop in range(1,MAX_HOP+1):
             if nb not in hops: hops[nb]=hop; nxt.add(nb)
     frontier=nxt
 scope=set(hops)
-print(f"Seeds {len(seeds)} -> scope {len(scope)} docs within {MAX_HOP} hops")
+print(f"Seeds {len(seeds)} -> scope {len(scope)} docs within {MAX_HOP} hops\n")
 
 # --- BM25 rank chunks WITHIN scope only ---
 scored=[]
@@ -111,20 +108,17 @@ for c in scored:
     chosen.append(c); seen_h.add(h); seen_sh.append(sh)
     per_doc[c["reference"]]=per_doc.get(c["reference"],0)+1
 
-# --- final output: only content, title, reference ---
-results = [
-    {"content": c["content"], "title": c["title"], "reference": c["reference"]}
-    for c in chosen
-]
-
-# payload for Cell 20 (eval) — same three fields
-response_kg = {"predictions": [{"data": results}]}
-
-# clean display: title + reference + content only
-print("="*80)
-print(f"TOP {len(results)} CHUNKS")
-print("="*80)
-for i, r in enumerate(results, 1):
-    print(f"\n[{i}] TITLE     : {r['title']}")
-    print(f"    REFERENCE : {r['reference']}")
-    print(f"    CONTENT   : {r['content'][:300]}...")
+# ----------------------------------------------------------
+# Response payload  (content, title, reference — NO LLM)
+# ----------------------------------------------------------
+response_kg = {
+    "predictions": [{
+        "data": [
+            {"content": c["content"], "title": c["title"], "reference": c["reference"]}
+            for c in chosen
+        ]
+    }]
+}
+print("Status Code: 200\n")
+print("Response:")
+print(json.dumps(response_kg, indent=2, ensure_ascii=False))
