@@ -94,3 +94,7 @@ print("\n" + "="*80); print(f"TOP {TOP_K} DOCUMENTS"); print("="*80)
 if not candidates: print("No content-bearing docs in scope for this query.")
 for r, c in enumerate(candidates, 1):
     print(f"{r:>2}. score={c['score']:6.2f} hop={c['hop']}  {c['title'][:55]}")
+
+
+
+print(type(KG), "| edges:", len(retrieved_edges), "| scope:", len(scope), "/", KG.number_of_nodes())
