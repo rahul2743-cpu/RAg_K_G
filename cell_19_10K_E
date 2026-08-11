@@ -1,0 +1,208 @@
+# ==========================================================
+# Cell 19 : KG CHUNK RETRIEVER  ->  response_kg   (NO LLM)
+#
+#   Query -> top-K chunks -> {content, title, reference} payload.
+#   Built to be directly comparable against a vector-search baseline:
+#   same input (a query string), same output shape, no LLM on either
+#   side of the comparison.
+#
+#   NO LLM ANYWHERE. Cell 15's extract_query_entities is NOT used.
+#   Entity linking is lexical (token overlap against rdfs:label), the
+#   same mechanism as lexical_fallback in Cell 16. No embeddings.
+#
+#   TWO SCORING SIGNALS:
+#     1. LEXICAL -- IDF-weighted token overlap. Raw token count would
+#        rank a chunk highly just for repeating common words; IDF
+#        weights rare terms (the ones that identify a topic) above
+#        frequent ones.
+#     2. GRAPH   -- a boost when the chunk's document is reachable by
+#        traversing the KG from lexically-matched seed nodes. This is
+#        the part a vector search cannot do: a document CONNECTED to
+#        the query's entities outranks one that merely shares words
+#        with it. Set use_graph=False to isolate this contribution.
+#
+#   Needs: Cell 14 (PREFIXES, NODE_LABEL, _tokens, HOP_DECAY),
+#          Cell 16 (traverse, lexical_fallback)
+# ==========================================================
+import math
+import re
+import json
+from collections import defaultdict
+
+print("=" * 80)
+print("CELL 19 — KG CHUNK RETRIEVER (no LLM)")
+print("=" * 80)
+
+CHUNK_SIZE      = 900     # target chars per chunk
+CHUNK_OVERLAP   = 150     # carry-over so a fact split across a boundary
+                          # still appears whole in at least one chunk
+MIN_CHUNK_CHARS = 80      # drop fragments too short to be useful
+TOP_K           = 10000
+GRAPH_BOOST     = 1.6     # max multiplier for graph-connected chunks
+
+# ---- Step 1: content + title + reference for every document -------------
+# ex:sourceReference is what Cell 11 stored as the original node_id --
+# that is the "reference" field in the output payload.
+DOC_FULL_QUERY = PREFIXES + """
+SELECT ?doc ?label ?ref ?content
+WHERE {
+    ?doc ex:documentContent ?content .
+    OPTIONAL { ?doc rdfs:label         ?label }
+    OPTIONAL { ?doc ex:sourceReference ?ref }
+}
+"""
+
+
+def _split_chunks(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Paragraph-aware splitter. Packs whole paragraphs up to `size`
+    rather than cutting at a fixed offset, so boundaries land between
+    ideas instead of mid-sentence. Hard-slices only a single paragraph
+    that is itself longer than `size`."""
+    if not text:
+        return []
+
+    paras = [p.strip() for p in re.split(r"\n\s*\n|\.\s+(?=[A-Z])", text) if p.strip()]
+    chunks, buf = [], ""
+
+    for p in paras:
+        if len(p) > size:                       # oversized single paragraph
+            if buf:
+                chunks.append(buf.strip())
+                buf = ""
+            for i in range(0, len(p), size - overlap):
+                chunks.append(p[i:i + size].strip())
+            continue
+
+        if len(buf) + len(p) + 1 <= size:
+            buf = f"{buf} {p}".strip()
+        else:
+            if buf:
+                chunks.append(buf.strip())
+            tail = buf[-overlap:] if overlap and len(buf) > overlap else ""
+            buf = f"{tail} {p}".strip()
+
+    if buf:
+        chunks.append(buf.strip())
+
+    return [c for c in chunks if len(c) >= MIN_CHUNK_CHARS]
+
+
+# ---- Step 2: build the chunk index ONCE ---------------------------------
+CHUNKS = []
+_df_counts = defaultdict(int)          # token -> chunks containing it (for IDF)
+
+for row in g.query(DOC_FULL_QUERY):
+    doc_uri = str(row.doc)
+    title   = str(row.label) if row.label else NODE_LABEL.get(doc_uri, doc_uri)
+    ref     = str(row.ref) if row.ref else ""
+    content = str(row.content)
+
+    for i, chunk_text in enumerate(_split_chunks(content)):
+        toks = _tokens(chunk_text)
+        CHUNKS.append({
+            "chunk_id":  f"{doc_uri}#chunk{i}",
+            "doc_uri":   doc_uri,
+            "title":     title,
+            "reference": ref,
+            "content":   chunk_text,
+            "tokens":    toks,
+        })
+        for t in set(toks):
+            _df_counts[t] += 1
+
+N_CHUNKS = len(CHUNKS)
+IDF = {t: math.log(1 + (N_CHUNKS / (1 + df))) for t, df in _df_counts.items()}
+
+print(f"Documents chunked   : {len({c['doc_uri'] for c in CHUNKS})}")
+print(f"Chunks indexed      : {N_CHUNKS}")
+print(f"Vocabulary (tokens) : {len(IDF)}")
+if N_CHUNKS == 0:
+    print("\nSTOP -- no chunks built. Check ex:documentContent exists in g.")
+
+
+# ---- Step 3: retrieval --------------------------------------------------
+def retrieve_chunks(query, top_k=TOP_K, use_graph=True, verbose=True):
+    """Query -> ranked chunks. Returns dicts with content/title/reference
+    plus score fields for inspection. NO LLM is called."""
+    q_toks = _tokens(query)
+    if not q_toks:
+        return []
+
+    # graph signal -- lexical_fallback links entities WITHOUT an LLM,
+    # then traverse() expands through the reified statements as usual.
+    graph_docs = {}
+    if use_graph:
+        seeds = lexical_fallback(query, limit=10)
+        if seeds:
+            _edges, visited = traverse(seeds)
+            for node, (hop, seed_score) in visited.items():
+                graph_docs[node] = max(
+                    graph_docs.get(node, 0.0),
+                    (seed_score / 100.0) * (HOP_DECAY ** hop),
+                )
+
+    q_weight = sum(IDF.get(t, 0.0) for t in q_toks) or 1.0
+    scored = []
+
+    for c in CHUNKS:
+        overlap = q_toks & c["tokens"]
+        if not overlap:
+            continue
+        lex = sum(IDF.get(t, 0.0) for t in overlap) / q_weight
+        boost = 1.0 + (GRAPH_BOOST - 1.0) * graph_docs.get(c["doc_uri"], 0.0)
+        scored.append({
+            "score":       lex * boost,
+            "lexical":     round(lex, 4),
+            "graph_boost": round(boost, 3),
+            "title":       c["title"],
+            "reference":   c["reference"],
+            "content":     c["content"],
+            "doc_uri":     c["doc_uri"],
+            "chunk_id":    c["chunk_id"],
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    results = scored[:top_k]
+
+    if verbose:
+        print(f"\nQuery             : {query}")
+        print(f"Graph-linked nodes: {len(graph_docs)}")
+        print(f"Chunks matched    : {len(scored)}  -> returning {len(results)}")
+
+    return results
+
+
+# ==========================================================
+# Query
+# ==========================================================
+QUERY_KG = "What are some common meanings of the acronym AWS mentioned in this document?"
+
+print(f"\n[Cell 19 using query]: {QUERY_KG}")
+
+chosen = retrieve_chunks(QUERY_KG, top_k=TOP_K, verbose=True)
+
+# ----------------------------------------------------------
+# Response payload  (content, title, reference — NO LLM)
+# ----------------------------------------------------------
+response_kg = {
+    "predictions": [{
+        "data": [
+            {"content": c["content"], "title": c["title"], "reference": c["reference"]}
+            for c in chosen
+        ]
+    }]
+}
+
+n_returned = len(response_kg["predictions"][0]["data"])
+print(f"\nResponse KG: {n_returned} chunk(s)")
+
+# Print a preview, not all 10k -- a full dump of every chunk floods the
+# notebook output and makes the result unreadable. response_kg itself
+# holds the complete payload regardless of what is printed here.
+PREVIEW = 3
+print(json.dumps(
+    {"predictions": [{"data": response_kg["predictions"][0]["data"][:PREVIEW]}]},
+    indent=2, ensure_ascii=False
+))
+if n_returned > PREVIEW:
+    print(f"... {n_returned - PREVIEW} more chunk(s) in response_kg")
