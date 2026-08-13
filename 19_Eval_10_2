@@ -1,0 +1,192 @@
+# ==========================================================
+# Cell 19 : STRICT KG-ONLY TOP-10 CHUNK RETRIEVER
+#           NO LLM · NO BM25 · NO embeddings · NO vector search
+#
+#   Query -> KG lexical node matching -> SPARQL multi-hop traversal
+#   over reified statements -> graph evidence -> KG-grounded documents
+#   -> top-10 chunks.   Output var: response_kg
+#
+#   RANKING IS 100% GRAPH-DERIVED:
+#       seed_score  x  ex:strength  x  hop decay
+#   No query-term overlap enters the score at any point.
+#
+#   ex:strength is Cell 10's LLM-assigned 1-10 rating of how explicit
+#   each relationship is. Using it means a strength-9 edge contributes
+#   4.5x what a strength-2 edge does -- plain graph adjacency would
+#   treat them identically.
+#
+#   Needs: Cell 14 (PREFIXES, NODE_LABEL, _tokens, HOP_DECAY, MAX_HOPS)
+#          Cell 16 (lexical_fallback, traverse)
+# ==========================================================
+import re, math, json, hashlib
+from collections import defaultdict
+
+print("=" * 80)
+print("CELL 19 — STRICT KG-ONLY TOP-10 CHUNK RETRIEVER")
+print("=" * 80)
+
+TOP_K       = 10
+CHUNK_SIZE  = 900
+MIN_CHUNK   = 120
+MAX_PER_DOC = 3       # stop one document owning the whole top-10
+JACCARD     = 0.25    # near-duplicate threshold
+SHINGLE_N   = 5
+
+QUERY_KG = ("What steps should be taken if an Engineering Supplier Integration "
+            "Document (ESID) is not already available for a supplier?")
+print(f"[Cell 19 using query]: {QUERY_KG}\n")
+
+# Unresolved links keep raw markup like "[<doc:wiki:...WebHome>]".
+# Machine noise, not document text -- strip before chunking.
+_MARKUP = re.compile(r"\[?<doc:(?:wiki:)?[^<>]+>\]?")
+
+
+def _clean(t):
+    return re.sub(r"\s+", " ", _MARKUP.sub(" ", str(t or ""))).strip()
+
+
+def _shingles(t, n=SHINGLE_N):
+    w = re.findall(r"[a-z0-9]+", t.lower())
+    return {" ".join(w[i:i + n]) for i in range(max(0, len(w) - n + 1))}
+
+
+def _split_chunks(text, size=CHUNK_SIZE):
+    """Sentence-boundary packing, no overlap. Overlap would duplicate the
+    tail of each chunk into the next, and at top-10 that wastes slots."""
+    units = [u.strip() for u in re.split(r"(?<=[.!?])\s+|\n+", text) if u.strip()]
+    out, buf = [], ""
+    for u in units:
+        if len(u) > size:                       # single oversized unit
+            if buf:
+                out.append(buf); buf = ""
+            for i in range(0, len(u), size):
+                out.append(u[i:i + size])
+            continue
+        if len(buf) + len(u) + 1 <= size:
+            buf = f"{buf} {u}".strip()
+        else:
+            if buf:
+                out.append(buf)
+            buf = u
+    if buf:
+        out.append(buf)
+    return [c for c in out if len(c) >= MIN_CHUNK]
+
+
+# ---- Chunk corpus, keyed by document URI --------------------------------
+# Content read from the RDF graph `g` (Cell 11), never from NetworkX `G`.
+DOC_Q = PREFIXES + """
+SELECT ?doc ?label ?ref ?content
+WHERE {
+    ?doc ex:documentContent ?content .
+    OPTIONAL { ?doc rdfs:label         ?label }
+    OPTIONAL { ?doc ex:sourceReference ?ref }
+}
+"""
+
+CHUNKS_BY_DOC = defaultdict(list)
+for row in g.query(DOC_Q):
+    uri   = str(row.doc)
+    title = str(row.label) if row.label else NODE_LABEL.get(uri, uri)
+    ref   = str(row.ref) if row.ref else uri
+    for ch in _split_chunks(_clean(str(row.content))):
+        CHUNKS_BY_DOC[uri].append({"content": ch, "title": title,
+                                   "reference": ref, "doc_uri": uri})
+
+N_CHUNKS = sum(len(v) for v in CHUNKS_BY_DOC.values())
+print(f"Corpus            : {N_CHUNKS} chunks across {len(CHUNKS_BY_DOC)} documents")
+
+
+# ---- Step 1: KG lexical node matching (no LLM) -------------------------
+# link_entities() is deliberately NOT used: it would receive the entire
+# question as one phrase, and CONTAINS(?label, "<whole question>")
+# matches nothing. lexical_fallback tokenises the query and scores
+# against node labels, which is the correct no-LLM linking path.
+seeds = lexical_fallback(QUERY_KG, limit=10)
+
+print(f"Seed nodes        : {len(seeds)}")
+for _u, lbl, sc, _p in seeds[:5]:
+    print(f"   {sc:5.1f}  {lbl[:60]}")
+
+if not seeds:
+    print("\nSTOP -- no query token matches any KG node label.")
+
+
+# ---- Step 2: SPARQL multi-hop traversal over reified statements --------
+edges, visited = traverse(seeds)
+print(f"\nEdges traversed   : {len(edges)}  (SPARQL over rdf:Statement)")
+print(f"Nodes in scope    : {len(visited)}  within {MAX_HOPS} hops")
+
+
+# ---- Step 3: graph evidence per document -------------------------------
+# Each traversed edge deposits evidence on BOTH endpoints, weighted by:
+#     ex:strength/10  -- how explicit Cell 10's LLM judged the relationship
+#     HOP_DECAY^hop   -- distance from the query's matched entities
+#     seed_score/100  -- how well the entity matched in the first place
+# SUMMED, not maxed: a document supported by several strong relationships
+# should outrank one resting on a single strong relationship.
+doc_evidence = defaultdict(float)
+
+for e in edges:
+    w = ((e["strength"] / 10.0)
+         * (HOP_DECAY ** (e["hop"] - 1))
+         * (e["seed_score"] / 100.0))
+    doc_evidence[e["source"]] += w
+    doc_evidence[e["target"]] += w
+
+# Seed documents carry evidence even if no edge attaches to them.
+for uri, _lbl, score, _p in seeds:
+    doc_evidence[uri] = max(doc_evidence[uri], score / 100.0)
+
+scoped_docs = {d for d in doc_evidence if d in CHUNKS_BY_DOC}
+print(f"KG-grounded docs  : {len(scoped_docs)}\n")
+
+
+# ---- Step 4: rank chunks by their document's graph evidence ------------
+# NOTE, stated plainly: the graph scores DOCUMENTS, not chunks. Every
+# chunk of a document therefore inherits the same score, and which ones
+# survive MAX_PER_DOC is corpus order, not relevance. That is the honest
+# cost of strict KG-only ranking at chunk granularity -- no KG signal
+# distinguishes two passages inside the same document.
+scored = []
+for uri in sorted(scoped_docs, key=lambda d: doc_evidence[d], reverse=True):
+    ev = doc_evidence[uri]
+    for c in CHUNKS_BY_DOC[uri]:
+        scored.append({**c, "_score": round(ev, 4), "_graph_evidence": round(ev, 4)})
+
+scored.sort(key=lambda x: x["_score"], reverse=True)
+
+
+# ---- Step 5: dedup + per-doc cap -> top 10 -----------------------------
+chosen, seen_h, seen_sh, per_doc = [], set(), [], defaultdict(int)
+for c in scored:
+    if len(chosen) >= TOP_K:
+        break
+    if per_doc[c["reference"]] >= MAX_PER_DOC:
+        continue
+    h = hashlib.md5(c["content"].encode()).hexdigest()
+    if h in seen_h:
+        continue
+    sh = _shingles(c["content"])
+    if sh and any(len(sh & p) / len(sh | p) > JACCARD for p in seen_sh):
+        continue
+    chosen.append(c); seen_h.add(h); seen_sh.append(sh)
+    per_doc[c["reference"]] += 1
+
+
+# ---- Response payload (content, title, reference — NO LLM) -------------
+response_kg = {
+    "predictions": [{
+        "data": [
+            {"content": c["content"], "title": c["title"], "reference": c["reference"]}
+            for c in chosen
+        ]
+    }]
+}
+
+print(f"Response KG: {len(chosen)} chunk(s)")
+print("-" * 80)
+for i, c in enumerate(chosen, 1):
+    print(f"{i:2d}. [graph {c['_graph_evidence']:.4f}]  {c['title'][:58]}")
+print("-" * 80)
+print(json.dumps(response_kg, indent=2, ensure_ascii=False))
